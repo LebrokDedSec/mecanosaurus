@@ -68,6 +68,7 @@ class _ControlScreenState extends State<ControlScreen> {
   bool _isScanning = false;
   List<ScanResult> _matchingResults = <ScanResult>[];
   BluetoothCharacteristic? _controlCharacteristic;
+  Timer? _driveHeartbeat;
 
   StreamSubscription<BluetoothAdapterState>? _adapterSub;
   StreamSubscription<bool>? _scanStateSub;
@@ -77,6 +78,11 @@ class _ControlScreenState extends State<ControlScreen> {
   @override
   void initState() {
     super.initState();
+    _driveHeartbeat = Timer.periodic(const Duration(milliseconds: 100), (_) {
+      if (_controlCharacteristic == null) return;
+      unawaited(_sendDriveToEsp());
+    });
+
     _adapterSub = FlutterBluePlus.adapterState.listen((state) {
       if (!mounted) return;
       setState(() {
@@ -112,6 +118,7 @@ class _ControlScreenState extends State<ControlScreen> {
 
   @override
   void dispose() {
+    _driveHeartbeat?.cancel();
     _adapterSub?.cancel();
     _scanStateSub?.cancel();
     _scanResultsSub?.cancel();
@@ -136,7 +143,6 @@ class _ControlScreenState extends State<ControlScreen> {
       await FlutterBluePlus.stopScan();
       await FlutterBluePlus.startScan(
         timeout: const Duration(seconds: 8),
-        withNames: const <String>[_targetDeviceName],
       );
 
       if (!mounted) return;
@@ -211,7 +217,7 @@ class _ControlScreenState extends State<ControlScreen> {
       });
 
       if (control != null) {
-        await _sendOmegaToEsp(_omega);
+        await _sendDriveToEsp();
       }
     } catch (e) {
       if (!mounted) return;
@@ -242,11 +248,18 @@ class _ControlScreenState extends State<ControlScreen> {
   }
 
   Future<void> _sendOmegaToEsp(double value) async {
+    _omega = value;
+    await _sendDriveToEsp();
+  }
+
+  Future<void> _sendDriveToEsp() async {
     final characteristic = _controlCharacteristic;
     if (characteristic == null) return;
 
     try {
-      final payload = utf8.encode('OMEGA:${value.toStringAsFixed(3)}');
+      final payload = utf8.encode(
+        'DRIVE:${_joyX.toStringAsFixed(3)},${_joyY.toStringAsFixed(3)},${_omega.toStringAsFixed(3)}',
+      );
       if (characteristic.properties.writeWithoutResponse) {
         await characteristic.write(payload, withoutResponse: true);
       } else if (characteristic.properties.write) {
@@ -268,6 +281,7 @@ class _ControlScreenState extends State<ControlScreen> {
       _joyX = clamped.dx / maxTravel;
       _joyY = -clamped.dy / maxTravel;
     });
+    unawaited(_sendDriveToEsp());
   }
 
   void _handleJoyEnd() {
@@ -276,6 +290,7 @@ class _ControlScreenState extends State<ControlScreen> {
       _joyX = 0.0;
       _joyY = 0.0;
     });
+    unawaited(_sendDriveToEsp());
   }
 
   void _handleSliderEnd() {
@@ -283,6 +298,7 @@ class _ControlScreenState extends State<ControlScreen> {
       _sliderKnobX = 0.0;
       _omega = 0.0;
     });
+    unawaited(_sendDriveToEsp());
   }
 
   @override
@@ -443,11 +459,10 @@ class _ControlScreenState extends State<ControlScreen> {
                                 _sliderKnobX = dx;
                                 _omega = nextOmega;
                               });
-                              unawaited(_sendOmegaToEsp(nextOmega));
+                              unawaited(_sendDriveToEsp());
                             },
                             onPanEnd: (_) {
                               _handleSliderEnd();
-                              unawaited(_sendOmegaToEsp(0.0));
                             },
                             child: SizedBox(
                               width: trackW,
