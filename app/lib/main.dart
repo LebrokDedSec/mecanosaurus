@@ -50,7 +50,8 @@ class ControlScreen extends StatefulWidget {
   State<ControlScreen> createState() => _ControlScreenState();
 }
 
-class _ControlScreenState extends State<ControlScreen> {
+class _ControlScreenState extends State<ControlScreen>
+  with WidgetsBindingObserver {
   static const String _targetDeviceName = 'ESP32-S3-DEVKITC-1-N16R8V';
   static const String _controlServiceUuid = '12345678-1234-1234-1234-1234567890ab';
   static const String _controlCharacteristicUuid = '12345678-1234-1234-1234-1234567890ac';
@@ -69,6 +70,8 @@ class _ControlScreenState extends State<ControlScreen> {
   List<ScanResult> _matchingResults = <ScanResult>[];
   BluetoothCharacteristic? _controlCharacteristic;
   Timer? _driveHeartbeat;
+  bool _controlWriteInFlight = false;
+  String? _queuedControlPayload;
 
   StreamSubscription<BluetoothAdapterState>? _adapterSub;
   StreamSubscription<bool>? _scanStateSub;
@@ -78,7 +81,8 @@ class _ControlScreenState extends State<ControlScreen> {
   @override
   void initState() {
     super.initState();
-    _driveHeartbeat = Timer.periodic(const Duration(milliseconds: 100), (_) {
+    WidgetsBinding.instance.addObserver(this);
+    _driveHeartbeat = Timer.periodic(const Duration(milliseconds: 70), (_) {
       if (_controlCharacteristic == null) return;
       unawaited(_sendDriveToEsp());
     });
@@ -118,12 +122,23 @@ class _ControlScreenState extends State<ControlScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _driveHeartbeat?.cancel();
     _adapterSub?.cancel();
     _scanStateSub?.cancel();
     _scanResultsSub?.cancel();
     _connectionStateSub?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      unawaited(_zeroControlsAndSendStop());
+    }
   }
 
   Future<void> _scanForEsp32() async {
@@ -203,6 +218,8 @@ class _ControlScreenState extends State<ControlScreen> {
             _connectedDevice = null;
             _controlCharacteristic = null;
             _btStatus = 'Disconnected';
+            _controlWriteInFlight = false;
+            _queuedControlPayload = null;
           }
         });
       });
@@ -238,6 +255,8 @@ class _ControlScreenState extends State<ControlScreen> {
         _connectedDevice = null;
         _controlCharacteristic = null;
         _btStatus = 'Disconnected';
+        _controlWriteInFlight = false;
+        _queuedControlPayload = null;
       });
     } catch (e) {
       if (!mounted) return;
@@ -248,26 +267,78 @@ class _ControlScreenState extends State<ControlScreen> {
   }
 
   Future<void> _sendOmegaToEsp(double value) async {
-    _omega = value;
+    _omega = _clampNormalized(value);
     await _sendDriveToEsp();
   }
 
-  Future<void> _sendDriveToEsp() async {
-    final characteristic = _controlCharacteristic;
-    if (characteristic == null) return;
+  double _clampNormalized(double value) {
+    return value.clamp(-1.0, 1.0).toDouble();
+  }
 
+  double _applyInputDeadzone(double value, {double threshold = 0.03}) {
+    return value.abs() < threshold ? 0.0 : value;
+  }
+
+  void _resetControlsToZero() {
+    _knobOffset = Offset.zero;
+    _sliderKnobX = 0.0;
+    _joyX = 0.0;
+    _joyY = 0.0;
+    _omega = 0.0;
+  }
+
+  Future<void> _zeroControlsAndSendStop() async {
+    if (mounted) {
+      setState(_resetControlsToZero);
+    } else {
+      _resetControlsToZero();
+    }
+    await _sendStopToEsp();
+  }
+
+  Future<void> _sendStopToEsp() async {
+    await _sendControlPayload('STOP');
+    await _sendDriveToEsp();
+  }
+
+  Future<void> _sendControlPayload(String payloadStr) async {
+    if (_controlCharacteristic == null) return;
+
+    _queuedControlPayload = payloadStr;
+    if (_controlWriteInFlight) return;
+
+    _controlWriteInFlight = true;
     try {
-      final payload = utf8.encode(
-        'DRIVE:${_joyX.toStringAsFixed(3)},${_joyY.toStringAsFixed(3)},${_omega.toStringAsFixed(3)}',
-      );
-      if (characteristic.properties.writeWithoutResponse) {
-        await characteristic.write(payload, withoutResponse: true);
-      } else if (characteristic.properties.write) {
-        await characteristic.write(payload, withoutResponse: false);
+      while (_queuedControlPayload != null) {
+        final currentPayload = _queuedControlPayload!;
+        _queuedControlPayload = null;
+
+        final characteristic = _controlCharacteristic;
+        if (characteristic == null) {
+          break;
+        }
+
+        final bytes = utf8.encode(currentPayload);
+        if (characteristic.properties.writeWithoutResponse) {
+          await characteristic.write(bytes, withoutResponse: true);
+        } else if (characteristic.properties.write) {
+          await characteristic.write(bytes, withoutResponse: false);
+        }
       }
     } catch (_) {
       // Keep UI responsive even when a single BLE write fails.
+    } finally {
+      _controlWriteInFlight = false;
     }
+  }
+
+  Future<void> _sendDriveToEsp() async {
+    final x = _applyInputDeadzone(_clampNormalized(_joyX));
+    final y = _applyInputDeadzone(_clampNormalized(_joyY));
+    final omega = _applyInputDeadzone(_clampNormalized(_omega));
+    final payload =
+        'DRIVE:${x.toStringAsFixed(3)},${y.toStringAsFixed(3)},${omega.toStringAsFixed(3)}';
+    await _sendControlPayload(payload);
   }
 
   void _handleJoyPan(Offset localPos) {
@@ -278,8 +349,8 @@ class _ControlScreenState extends State<ControlScreen> {
         : delta;
     setState(() {
       _knobOffset = clamped;
-      _joyX = clamped.dx / maxTravel;
-      _joyY = -clamped.dy / maxTravel;
+      _joyX = _clampNormalized(clamped.dx / maxTravel);
+      _joyY = _clampNormalized(-clamped.dy / maxTravel);
     });
     unawaited(_sendDriveToEsp());
   }
@@ -454,7 +525,7 @@ class _ControlScreenState extends State<ControlScreen> {
                             onPanUpdate: (d) {
                               final dx = (d.localPosition.dx - halfW)
                                   .clamp(-halfW, halfW);
-                              final nextOmega = -(dx / halfW);
+                              final nextOmega = _clampNormalized(dx / halfW);
                               setState(() {
                                 _sliderKnobX = dx;
                                 _omega = nextOmega;
@@ -464,6 +535,7 @@ class _ControlScreenState extends State<ControlScreen> {
                             onPanEnd: (_) {
                               _handleSliderEnd();
                             },
+                            onPanCancel: _handleSliderEnd,
                             child: SizedBox(
                               width: trackW,
                               height: 44,
@@ -506,6 +578,7 @@ class _ControlScreenState extends State<ControlScreen> {
                 child: GestureDetector(
                   onPanUpdate: (d) => _handleJoyPan(d.localPosition),
                   onPanEnd: (_) => _handleJoyEnd(),
+                  onPanCancel: _handleJoyEnd,
                   child: Container(
                     width: 220,
                     height: 220,

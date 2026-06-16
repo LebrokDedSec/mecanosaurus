@@ -12,9 +12,10 @@ namespace {
 constexpr char kBleDeviceName[] = "ESP32-S3-DEVKITC-1-N16R8V";
 constexpr char kServiceUuid[] = "12345678-1234-1234-1234-1234567890ab";
 constexpr char kControlCharUuid[] = "12345678-1234-1234-1234-1234567890ac";
+constexpr char kTelemetryCharUuid[] = "12345678-1234-1234-1234-1234567890ad";
 
 // Ustaw tutaj swoje GPIO zgodnie z podlaczeniem.
-constexpr int kFrontLeftPwmPin = 16;   // Lewy przod: PWM
+constexpr int kFrontLeftPwmPin = 16;   // Lewy przod: PWM 
 constexpr int kFrontLeftIn1Pin = 7;    // Lewy przod: IN1
 constexpr int kFrontLeftIn2Pin = 15;   // Lewy przod: IN2
 
@@ -43,30 +44,61 @@ constexpr uint8_t kPwmResolutionBits = 8;
 constexpr int kPwmMax = (1 << kPwmResolutionBits) - 1;
 constexpr float kDeadband = 0.08f;
 constexpr uint32_t kCommandTimeoutMs = 350;
+constexpr bool kUseActiveBraking = true;
 constexpr uint8_t kRgbPin = 48;
 constexpr uint8_t kRgbPixelCount = 1;
 constexpr uint32_t kHeartbeatIntervalMs = 500;
 constexpr uint32_t kTestPhaseDurationMs = 2000;
 constexpr float kTestMoveSpeed = 0.8f;
+constexpr bool kRunStartupDriveSequence = false;
+constexpr bool kEncoderTestOnly = false;
+constexpr float kEncoderTestMotorCommand = 0.35f;
+constexpr uint32_t kEncoderTestStepDurationMs = 2500;
+constexpr uint32_t kControlIntervalMs = 20;
 constexpr uint32_t kEncoderReportIntervalMs = 250;
+constexpr uint32_t kTelemetryIntervalMs = 100;
+constexpr bool kSerialPlotterTelemetry = true;
+constexpr bool kSerialOnlyReceivedValues = true;
+constexpr bool kUseEncoders = false;
 constexpr int32_t kEncoderCountsPerRevolution = 44;
+constexpr float kMaxWheelRpm = 220.0f;
+constexpr float kPi = 3.14159265358979323846f;
+constexpr float kWheelRadiusMeters = 0.050f;       // promien kola [m] (50 mm)
+constexpr float kWheelbaseLengthMeters = 0.260f;   // odleglosc os przod-tyl [m] (260 mm)
+constexpr float kTrackWidthMeters = 0.486f;        // odleglosc kol lewo-prawo [m] (486 mm)
+constexpr float kWheelbaseRadiusMeters =
+  (kWheelbaseLengthMeters * 0.5f) + (kTrackWidthMeters * 0.5f);
+constexpr float kMaxWheelAngularRadPerSec = (kMaxWheelRpm * 2.0f * kPi) / 60.0f;
+constexpr float kSafeWheelbaseRadiusMeters =
+  (kWheelbaseRadiusMeters > 0.001f) ? kWheelbaseRadiusMeters : 0.001f;
+constexpr float kMaxRobotVxMps =
+  kMaxWheelAngularRadPerSec * kWheelRadiusMeters;  // +x = prawo [m/s]
+constexpr float kMaxRobotVyMps =
+  kMaxWheelAngularRadPerSec * kWheelRadiusMeters;  // +y = przod [m/s]
+constexpr float kMaxRobotOmegaRadPerSec =
+  (kMaxWheelAngularRadPerSec * kWheelRadiusMeters) /
+  kSafeWheelbaseRadiusMeters;  // +omega = lewo (CCW) [rad/s]
+constexpr float kSpeedKp = 0.00275f;
+constexpr float kSpeedKi = 0.0100f;
+constexpr float kFeedforwardGain = 0.75f;
+constexpr float kIntegratorLimit = 0.60f;
 
 // Ustaw piny enkoderow. -1 oznacza "nieuzywany".
 constexpr int kFrontLeftEncAPin = 1;
 constexpr int kFrontLeftEncBPin = 2;
 constexpr int kFrontRightEncAPin = 47;
 constexpr int kFrontRightEncBPin = 48;
-constexpr int kRearLeftEncAPin = 42;  //good
-constexpr int kRearLeftEncBPin = 41;  //good
-constexpr int kRearRightEncAPin = 39; //good
-constexpr int kRearRightEncBPin = 40; //good
+constexpr int kRearLeftEncAPin = 42;
+constexpr int kRearLeftEncBPin = 41;
+constexpr int kRearRightEncAPin = 39;
+constexpr int kRearRightEncBPin = 40;
 
 constexpr bool kRgbPinConflictsWithEncoder =
   (kRgbPin == kFrontLeftEncAPin) || (kRgbPin == kFrontLeftEncBPin) ||
   (kRgbPin == kFrontRightEncAPin) || (kRgbPin == kFrontRightEncBPin) ||
   (kRgbPin == kRearLeftEncAPin) || (kRgbPin == kRearLeftEncBPin) ||
   (kRgbPin == kRearRightEncAPin) || (kRgbPin == kRearRightEncBPin);
-constexpr bool kUseStatusLed = !kRgbPinConflictsWithEncoder;
+constexpr bool kUseStatusLed = false;
 
 struct MotorPins {
   const char* name;
@@ -92,8 +124,17 @@ struct EncoderConfig {
 
 struct EncoderState {
   volatile int32_t count = 0;
-  int32_t lastCount = 0;
+  int32_t reportLastCount = 0;
+  int32_t controlLastCount = 0;
   bool enabled = false;
+};
+
+struct WheelControlState {
+  float targetNorm = 0.0f;
+  float targetRpm = 0.0f;
+  float measuredRpm = 0.0f;
+  float integrator = 0.0f;
+  float output = 0.0f;
 };
 
 constexpr MotorPins kFrontLeftMotor{"Przednie lewe", kFrontLeftPwmPin,
@@ -133,6 +174,8 @@ constexpr EncoderConfig kEncoders[] = {
 };
 
 NimBLEServer* gServer = nullptr;
+NimBLECharacteristic* gControlCharacteristic = nullptr;
+NimBLECharacteristic* gTelemetryCharacteristic = nullptr;
 DriveCommand gDriveCommand;
 uint32_t gLastCommandMs = 0;
 Adafruit_NeoPixel gRgb(kRgbPixelCount, kRgbPin, NEO_GRB + NEO_KHZ800);
@@ -141,7 +184,26 @@ uint32_t gLastHeartbeatToggleMs = 0;
 uint32_t gSequenceStartMs = 0;
 bool gSequenceFinished = false;
 EncoderState gEncoderStates[4];
+WheelControlState gWheelControl[4];
 uint32_t gLastEncoderReportMs = 0;
+uint32_t gLastControlMs = 0;
+uint32_t gLastTelemetryMs = 0;
+uint32_t gEncoderTestStartMs = 0;
+int gLastEncoderTestPhase = -1;
+
+constexpr const char* kWheelNames[4] = {
+  "FRONT_LEFT",
+  "FRONT_RIGHT",
+  "REAR_LEFT",
+  "REAR_RIGHT",
+};
+
+constexpr const char* kEncoderNames[4] = {
+  "ENC FL",
+  "ENC FR",
+  "ENC RL",
+  "ENC RR",
+};
 
 void setStatusLed(bool on) {
   if (!kUseStatusLed) {
@@ -205,6 +267,19 @@ void IRAM_ATTR encoderIsr2() { handleEncoderEdge(2); }
 void IRAM_ATTR encoderIsr3() { handleEncoderEdge(3); }
 
 void setupEncoders() {
+  if (!kUseEncoders) {
+    for (EncoderState& state : gEncoderStates) {
+      state.enabled = false;
+      state.count = 0;
+      state.reportLastCount = 0;
+      state.controlLastCount = 0;
+    }
+    if (!kSerialOnlyReceivedValues) {
+      Serial.println("Encoders disabled: open-loop mode");
+    }
+    return;
+  }
+
   void (*isrHandlers[4])() = {encoderIsr0, encoderIsr1, encoderIsr2, encoderIsr3};
 
   for (size_t i = 0; i < 4; ++i) {
@@ -219,16 +294,23 @@ void setupEncoders() {
     pinMode(encoder.pinA, INPUT_PULLUP);
     pinMode(encoder.pinB, INPUT_PULLUP);
     state.count = 0;
-    state.lastCount = 0;
+    state.reportLastCount = 0;
+    state.controlLastCount = 0;
     state.enabled = true;
 
     attachInterrupt(digitalPinToInterrupt(encoder.pinA), isrHandlers[i], CHANGE);
-    Serial.printf("%s configured on A=%d B=%d\n", encoder.name, encoder.pinA,
-                  encoder.pinB);
+    if (!kSerialOnlyReceivedValues) {
+      Serial.printf("%s configured on A=%d B=%d\n", encoder.name, encoder.pinA,
+                    encoder.pinB);
+    }
   }
 }
 
 void reportEncoders() {
+  if (kSerialOnlyReceivedValues) {
+    return;
+  }
+
   const uint32_t now = millis();
   if (now - gLastEncoderReportMs < kEncoderReportIntervalMs) {
     return;
@@ -241,6 +323,7 @@ void reportEncoders() {
     EncoderState& state = gEncoderStates[i];
 
     if (!state.enabled) {
+      Serial.printf("%s DISABLED\n", encoder.name);
       continue;
     }
 
@@ -248,8 +331,8 @@ void reportEncoders() {
     const int32_t currentCount = state.count;
     interrupts();
 
-    const int32_t delta = currentCount - state.lastCount;
-    state.lastCount = currentCount;
+    const int32_t delta = currentCount - state.reportLastCount;
+    state.reportLastCount = currentCount;
 
     const int pinAState = digitalRead(encoder.pinA);
     const int pinBState = digitalRead(encoder.pinB);
@@ -258,12 +341,43 @@ void reportEncoders() {
         (static_cast<float>(kEncoderCountsPerRevolution) *
          static_cast<float>(kEncoderReportIntervalMs));
 
-    if (delta != 0) {
-      const char* direction = delta > 0 ? "PLUS" : "MINUS";
-      Serial.printf("%s A=%d B=%d delta=%ld dir=%s count=%ld rpm=%.2f\n",
-                    encoder.name, pinAState, pinBState, static_cast<long>(delta),
-                    direction, static_cast<long>(currentCount), rpm);
-    }
+    const char* direction = delta > 0 ? "PLUS" : (delta < 0 ? "MINUS" : "ZERO");
+    Serial.printf("%s A=%d B=%d delta=%ld dir=%s count=%ld rpm_report=%.2f\n",
+                  encoder.name, pinAState, pinBState, static_cast<long>(delta),
+                  direction, static_cast<long>(currentCount), rpm);
+  }
+}
+
+void sendBleTelemetry() {
+  if (gTelemetryCharacteristic == nullptr) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - gLastTelemetryMs < kTelemetryIntervalMs) {
+    return;
+  }
+  gLastTelemetryMs = now;
+
+  char payload[192];
+  std::snprintf(
+      payload, sizeof(payload),
+      "T,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f",
+      gWheelControl[0].targetRpm, gWheelControl[0].measuredRpm,
+      gWheelControl[1].targetRpm, gWheelControl[1].measuredRpm,
+      gWheelControl[2].targetRpm, gWheelControl[2].measuredRpm,
+      gWheelControl[3].targetRpm, gWheelControl[3].measuredRpm);
+
+  gTelemetryCharacteristic->setValue(payload);
+  gTelemetryCharacteristic->notify();
+
+  if (kSerialPlotterTelemetry && !kSerialOnlyReceivedValues) {
+    Serial.printf(
+        "fl_set:%.2f,fl_meas:%.2f,fr_set:%.2f,fr_meas:%.2f,rl_set:%.2f,rl_meas:%.2f,rr_set:%.2f,rr_meas:%.2f\n",
+        gWheelControl[0].targetRpm, gWheelControl[0].measuredRpm,
+        gWheelControl[1].targetRpm, gWheelControl[1].measuredRpm,
+        gWheelControl[2].targetRpm, gWheelControl[2].measuredRpm,
+        gWheelControl[3].targetRpm, gWheelControl[3].measuredRpm);
   }
 }
 
@@ -273,9 +387,15 @@ void setDriverEnabled(bool enabled) {
 }
 
 void stopMotor(const MotorPins& motor) {
-  digitalWrite(motor.in1Pin, LOW);
-  digitalWrite(motor.in2Pin, LOW);
-  ledcWrite(motor.pwmChannel, 0);
+  if (kUseActiveBraking) {
+    digitalWrite(motor.in1Pin, HIGH);
+    digitalWrite(motor.in2Pin, HIGH);
+    ledcWrite(motor.pwmChannel, kPwmMax);
+  } else {
+    digitalWrite(motor.in1Pin, LOW);
+    digitalWrite(motor.in2Pin, LOW);
+    ledcWrite(motor.pwmChannel, 0);
+  }
 }
 
 void stopAllMotors() {
@@ -301,29 +421,114 @@ void setMotorOutput(const MotorPins& motor, float command) {
 }
 
 void applyDriveCommand(const DriveCommand& command) {
-  float frontLeft = command.y + command.x + command.omega;
-  float frontRight = command.y - command.x - command.omega;
-  float rearLeft = command.y - command.x + command.omega;
-  float rearRight = command.y + command.x - command.omega;
+  const float xNorm = clampUnit(command.x);      // +x = prawo
+  const float yNorm = clampUnit(command.y);      // +y = przod
+  const float omegaNorm = clampUnit(command.omega);  // +omega = lewo (CCW)
 
-  const float maxMagnitude = std::max(
-      1.0f,
-      std::max(
-          std::max(std::fabs(frontLeft), std::fabs(frontRight)),
-          std::max(std::fabs(rearLeft), std::fabs(rearRight))));
+  const float vx = xNorm * kMaxRobotVxMps;
+  const float vy = yNorm * kMaxRobotVyMps;
+  const float omega = omegaNorm * kMaxRobotOmegaRadPerSec;
 
-  frontLeft /= maxMagnitude;
-  frontRight /= maxMagnitude;
-  rearLeft /= maxMagnitude;
-  rearRight /= maxMagnitude;
+  const float safeWheelRadius = std::max(kWheelRadiusMeters, 0.001f);
+  const float invWheelRadius = 1.0f / safeWheelRadius;
 
-  setMotorOutput(kFrontLeftMotor, frontLeft);
-  setMotorOutput(kFrontRightMotor, frontRight);
-  setMotorOutput(kRearLeftMotor, rearLeft);
-  setMotorOutput(kRearRightMotor, rearRight);
+  // Mecanum inverse kinematics for frame: +x right, +y forward, +omega CCW.
+  float wheelAngularRadPerSec[4] = {
+      (vy + vx + (kWheelbaseRadiusMeters * omega)) * invWheelRadius,  // FL
+      (vy - vx - (kWheelbaseRadiusMeters * omega)) * invWheelRadius,  // FR
+      (vy - vx + (kWheelbaseRadiusMeters * omega)) * invWheelRadius,  // RL
+      (vy + vx - (kWheelbaseRadiusMeters * omega)) * invWheelRadius,  // RR
+  };
+
+  float maxWheelAbs = 0.0f;
+  for (float wheelSpeed : wheelAngularRadPerSec) {
+    maxWheelAbs = std::max(maxWheelAbs, std::fabs(wheelSpeed));
+  }
+
+  const float safeMaxWheelAngular = std::max(kMaxWheelAngularRadPerSec, 0.001f);
+  const float scale = maxWheelAbs > safeMaxWheelAngular
+                          ? (safeMaxWheelAngular / maxWheelAbs)
+                          : 1.0f;
+
+  const float wheelRpmFactor = 60.0f / (2.0f * kPi);
+  for (size_t i = 0; i < 4; ++i) {
+    const float wheelRadPerSec = wheelAngularRadPerSec[i] * scale;
+    gWheelControl[i].targetRpm = wheelRadPerSec * wheelRpmFactor;
+    gWheelControl[i].targetNorm = clampUnit(gWheelControl[i].targetRpm / kMaxWheelRpm);
+  }
+}
+
+void updateClosedLoopControl() {
+  const uint32_t now = millis();
+  const uint32_t dtMs = now - gLastControlMs;
+  if (dtMs < kControlIntervalMs) {
+    return;
+  }
+  gLastControlMs = now;
+
+  const float dtSeconds = static_cast<float>(dtMs) / 1000.0f;
+
+  for (size_t i = 0; i < 4; ++i) {
+    const MotorPins& motor = kMotors[i];
+    EncoderState& encoder = gEncoderStates[i];
+    WheelControlState& wheel = gWheelControl[i];
+
+    if (std::fabs(wheel.targetNorm) < kDeadband) {
+      wheel.targetNorm = 0.0f;
+      wheel.targetRpm = 0.0f;
+      wheel.measuredRpm = 0.0f;
+      wheel.integrator = 0.0f;
+      wheel.output = 0.0f;
+      stopMotor(motor);
+      continue;
+    }
+
+    if (!encoder.enabled) {
+      wheel.output = clampUnit(wheel.targetNorm);
+      setMotorOutput(motor, wheel.output);
+      continue;
+    }
+
+    noInterrupts();
+    const int32_t currentCount = encoder.count;
+    interrupts();
+
+    const int32_t delta = currentCount - encoder.controlLastCount;
+    encoder.controlLastCount = currentCount;
+
+    wheel.measuredRpm =
+        (static_cast<float>(delta) * 60.0f) /
+        (static_cast<float>(kEncoderCountsPerRevolution) * dtSeconds);
+
+    const float error = wheel.targetRpm - wheel.measuredRpm;
+    wheel.integrator = clampUnit(
+        wheel.integrator + (kSpeedKi * error * dtSeconds) / kIntegratorLimit) *
+                      kIntegratorLimit;
+
+    float output =
+        (kFeedforwardGain * wheel.targetNorm) + (kSpeedKp * error) + wheel.integrator;
+    output = clampUnit(output);
+
+    wheel.output = output;
+    setMotorOutput(motor, wheel.output);
+  }
+}
+
+void runEncoderTestMode() {
+  // Direct motor control without closed-loop
+  // Left wheels backward (0, 2), Right wheels forward (1, 3)
+  setMotorOutput(kMotors[0], -1.0f);  // FL backward
+  setMotorOutput(kMotors[1], 1.0f);   // FR forward
+  setMotorOutput(kMotors[2], -1.0f);  // RL backward
+  setMotorOutput(kMotors[3], 1.0f);   // RR forward
 }
 
 bool parseDriveCommand(const std::string& payload, DriveCommand& command) {
+  if (payload == "STOP") {
+    command = DriveCommand{};
+    return true;
+  }
+
   float x = 0.0f;
   float y = 0.0f;
   float omega = 0.0f;
@@ -338,6 +543,10 @@ bool parseDriveCommand(const std::string& payload, DriveCommand& command) {
     return false;
   }
 
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(omega)) {
+    return false;
+  }
+
   command.x = clampUnit(x);
   command.y = clampUnit(y);
   command.omega = clampUnit(omega);
@@ -346,30 +555,42 @@ bool parseDriveCommand(const std::string& payload, DriveCommand& command) {
 
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server) override {
-    Serial.printf("BLE connected, active links: %d\n", server->getConnectedCount());
+    if (!kSerialOnlyReceivedValues) {
+      Serial.printf("BLE connected, active links: %d\n", server->getConnectedCount());
+    }
   }
 
   void onDisconnect(NimBLEServer* server) override {
     stopAllMotors();
     gDriveCommand = DriveCommand{};
     NimBLEDevice::startAdvertising();
-    Serial.printf("BLE disconnected, active links: %d\n", server->getConnectedCount());
+    if (!kSerialOnlyReceivedValues) {
+      Serial.printf("BLE disconnected, active links: %d\n", server->getConnectedCount());
+    }
   }
 };
 
 class ControlCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* characteristic) override {
+    if (kEncoderTestOnly) {
+      return;
+    }
+
     const std::string payload = characteristic->getValue();
     DriveCommand nextCommand;
 
     if (!parseDriveCommand(payload, nextCommand)) {
-      Serial.printf("BLE RX bad payload: %s\n", payload.c_str());
+      if (!kSerialOnlyReceivedValues) {
+        Serial.printf("BLE RX bad payload: %s\n", payload.c_str());
+      }
       return;
     }
 
     gDriveCommand = nextCommand;
     gLastCommandMs = millis();
     applyDriveCommand(gDriveCommand);
+    Serial.printf("%.3f,%.3f,%.3f\n", gDriveCommand.x, gDriveCommand.y,
+                  gDriveCommand.omega);
   }
 };
 
@@ -386,9 +607,11 @@ void setup() {
     gRgb.setBrightness(30);
     setStatusLed(false);
   } else {
-    Serial.printf(
-        "Status LED disabled: RGB pin %u conflicts with encoder pin mapping\n",
-        static_cast<unsigned>(kRgbPin));
+    if (!kSerialOnlyReceivedValues) {
+      Serial.printf(
+          "Status LED disabled: RGB pin %u conflicts with encoder pin mapping\n",
+          static_cast<unsigned>(kRgbPin));
+    }
   }
   gLastHeartbeatToggleMs = millis();
 
@@ -405,17 +628,33 @@ void setup() {
   stopAllMotors();
   setupEncoders();
 
+  gEncoderTestStartMs = millis();
+  gLastEncoderTestPhase = -1;
+  gLastEncoderReportMs = millis();
+
+  if (kEncoderTestOnly) {
+    if (!kSerialOnlyReceivedValues) {
+      Serial.println("Encoder test mode enabled");
+      Serial.println("Sequence: each wheel forward/backward for 2.5s");
+      Serial.println("Watch logs: ENC FL/FR/RL/RR should match active wheel");
+    }
+  }
+
   NimBLEDevice::init(kBleDeviceName);
   gServer = NimBLEDevice::createServer();
   gServer->setCallbacks(&gServerCallbacks);
 
   NimBLEService* service = gServer->createService(kServiceUuid);
-  NimBLECharacteristic* controlCharacteristic = service->createCharacteristic(
+    gControlCharacteristic = service->createCharacteristic(
       kControlCharUuid,
       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
+    gTelemetryCharacteristic = service->createCharacteristic(
+      kTelemetryCharUuid,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
 
-  controlCharacteristic->setCallbacks(&gControlCallbacks);
-  controlCharacteristic->setValue("ready");
+    gControlCharacteristic->setCallbacks(&gControlCallbacks);
+    gControlCharacteristic->setValue("ready");
+    gTelemetryCharacteristic->setValue("T,0,0,0,0,0,0,0,0");
   service->start();
 
   NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
@@ -427,66 +666,65 @@ void setup() {
   gSequenceStartMs = millis();
   gSequenceFinished = false;
   gLastEncoderReportMs = millis();
+  gLastControlMs = millis();
+  gLastTelemetryMs = millis();
 
-  Serial.println("BLE DRIVE controller started");
-  Serial.printf("Advertising as: %s\n", kBleDeviceName);
-  Serial.println("Payload format: DRIVE:x,y,omega");
+  if (!kSerialOnlyReceivedValues) {
+    Serial.println("BLE DRIVE controller started");
+    Serial.printf("Advertising as: %s\n", kBleDeviceName);
+    Serial.println("Payload format: DRIVE:x,y,omega");
+    Serial.println("Telemetry notify UUID: 12345678-1234-1234-1234-1234567890ad");
+    Serial.println("Telemetry frame: T,fl_set,fl_meas,fr_set,fr_meas,rl_set,rl_meas,rr_set,rr_meas");
+    Serial.println("Serial Plotter: fl_set,fl_meas,fr_set,fr_meas,rl_set,rl_meas,rr_set,rr_meas");
+  }
 }
 
 void loop() {
   updateHeartbeat();
   reportEncoders();
 
-  const uint32_t elapsed = millis() - gSequenceStartMs;
-  if (elapsed < kTestPhaseDurationMs) {
-    DriveCommand forwardCommand;
-    forwardCommand.x = 0.0f;
-    forwardCommand.y = kTestMoveSpeed;
-    forwardCommand.omega = 0.0f;
-    applyDriveCommand(forwardCommand);
+  if (kEncoderTestOnly) {
+    runEncoderTestMode();
+    sendBleTelemetry();
     delay(20);
     return;
   }
 
-  if (elapsed < (2 * kTestPhaseDurationMs)) {
-    DriveCommand backwardCommand;
-    backwardCommand.x = 0.0f;
-    backwardCommand.y = -kTestMoveSpeed;
-    backwardCommand.omega = 0.0f;
-    applyDriveCommand(backwardCommand);
-    delay(20);
-    return;
-  }
+  DriveCommand commandForLoop = gDriveCommand;
 
-  if (elapsed < (3 * kTestPhaseDurationMs)) {
-    DriveCommand rightCommand;
-    rightCommand.x = kTestMoveSpeed;
-    rightCommand.y = 0.0f;
-    rightCommand.omega = 0.0f;
-    applyDriveCommand(rightCommand);
-    delay(20);
-    return;
-  }
-
-  if (elapsed < (4 * kTestPhaseDurationMs)) {
-    DriveCommand leftCommand;
-    leftCommand.x = -kTestMoveSpeed;
-    leftCommand.y = 0.0f;
-    leftCommand.omega = 0.0f;
-    applyDriveCommand(leftCommand);
-    delay(20);
-    return;
-  }
-
-  if (!gSequenceFinished) {
-    stopAllMotors();
-    gSequenceFinished = true;
+  if (kRunStartupDriveSequence) {
+    const uint32_t elapsed = millis() - gSequenceStartMs;
+    if (elapsed < kTestPhaseDurationMs) {
+      commandForLoop.x = 0.0f;
+      commandForLoop.y = kTestMoveSpeed;
+      commandForLoop.omega = 0.0f;
+    } else if (elapsed < (2 * kTestPhaseDurationMs)) {
+      commandForLoop.x = 0.0f;
+      commandForLoop.y = -kTestMoveSpeed;
+      commandForLoop.omega = 0.0f;
+    } else if (elapsed < (3 * kTestPhaseDurationMs)) {
+      commandForLoop.x = kTestMoveSpeed;
+      commandForLoop.y = 0.0f;
+      commandForLoop.omega = 0.0f;
+    } else if (elapsed < (4 * kTestPhaseDurationMs)) {
+      commandForLoop.x = -kTestMoveSpeed;
+      commandForLoop.y = 0.0f;
+      commandForLoop.omega = 0.0f;
+    } else if (!gSequenceFinished) {
+      gSequenceFinished = true;
+    }
   }
 
   if (millis() - gLastCommandMs > kCommandTimeoutMs) {
     gDriveCommand = DriveCommand{};
-    stopAllMotors();
+    commandForLoop = gDriveCommand;
+  } else {
+    commandForLoop = gDriveCommand;
   }
+
+  applyDriveCommand(commandForLoop);
+  updateClosedLoopControl();
+  sendBleTelemetry();
 
   delay(20);
 }
