@@ -1,0 +1,5 @@
+Umieść tutaj plik .ipa wyeksportowany z Xcode po:
+  flutter build ipa --release
+
+Ze względu na ograniczenia Apple, bezpośrednia dystrybucja IPA
+wymaga podpisanego certyfikatu Enterprise lub użycia TestFlight.

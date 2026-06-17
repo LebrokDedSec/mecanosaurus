@@ -1,0 +1,7 @@
+Umieść tutaj plik .apk wygenerowany przez:
+  flutter build apk --release
+
+Plik znajdziesz w:
+  app/build/app/outputs/flutter-apk/app-release.apk
+
+Zmień nazwę na Mecanosaurus-vX.Y.Z.apk przed wrzuceniem.
