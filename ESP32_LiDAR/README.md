@@ -23,3 +23,30 @@ This folder contains firmware for the second ESP32 board responsible for LiDAR h
 ## Next step
 
 Replace the placeholder logic in `src/main.cpp` with the specific LiDAR driver and pin mapping for your sensor.
+
+## Windows 2D viewer (top view)
+
+Simple desktop viewer for the serial LiDAR stream is available in:
+- `lidar_viewer_windows.py`
+
+The script expects serial lines in this format:
+- `PT,angle_deg,distance_mm,confidence,speed`
+
+### Install dependencies
+
+```powershell
+cd ESP32_LiDAR
+python -m pip install -r viewer_requirements.txt
+```
+
+### Run
+
+```powershell
+cd ESP32_LiDAR
+python lidar_viewer_windows.py --port COM17 --baud 115200
+```
+
+Useful options:
+- `--range 4000` view range in mm
+- `--min-confidence 60` filter weak points
+- `--max-age 1.2` drop stale points
