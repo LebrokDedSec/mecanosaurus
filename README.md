@@ -7,6 +7,7 @@ System sterowania robotem z kolami mecanum.
 - releases/ - gotowe buildy aplikacji do pobrania (APK/IPA)
 - ESP32/ - firmware głównego robota (PlatformIO)
 - ESP32_LiDAR/ - firmware modułu LiDAR (PlatformIO)
+- RaspberryPi/ - kod i konfiguracje dla modułu Raspberry Pi
 - firmware/ - kod ESP32/Arduino
 - simulation/ - symulacje (Webots, MATLAB, modele)
 - hardware/ - CAD, schematy i PCB
