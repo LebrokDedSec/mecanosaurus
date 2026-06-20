@@ -543,7 +543,10 @@ def main() -> None:
     detector = None
     fallback_detector = None
     if aruco_backend:
-        detector_params = cv2.aruco.DetectorParameters_create()
+        if hasattr(cv2.aruco, "DetectorParameters_create"):
+            detector_params = cv2.aruco.DetectorParameters_create()
+        else:
+            detector_params = cv2.aruco.DetectorParameters()
         detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         detector_params.cornerRefinementWinSize = 5
         detector_params.adaptiveThreshWinSizeMin = 3

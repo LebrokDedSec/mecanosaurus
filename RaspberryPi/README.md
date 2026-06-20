@@ -120,6 +120,30 @@ Parametry handshake BLE:
 - `--ble-telemetry-uuid` UUID charakterystyki telemetrycznej
 - `--ble-ready-timeout` timeout oczekiwania na gotowosc ESP po polaczeniu
 
+## Sterowanie ESP32 napedu po USB (UART CDC) na podstawie AprilTag
+
+Jesli Raspberry Pi jest podlaczone przewodem USB do ESP32, uzyj trybu USB:
+
+```bash
+cd RaspberryPi
+python3 src/apriltag_usb_follow.py \
+	--camera 0 \
+	--tag-id 0 \
+	--tag-size 0.12 \
+	--calib-file config/camera_calib.npz \
+	--distance-scale 1.52 \
+	--serial-port /dev/ttyACM0 \
+	--serial-baud 115200
+```
+
+Skrypt wysyla linie tekstowe do ESP32:
+- `DRIVE:x,y,omega`
+- `STOP`
+
+Priorytet sterowania pozostaje taki sam:
+- gdy aplikacja mobilna polaczy sie przez BLE, komendy USB z RPi sa ignorowane,
+- po rozlaczeniu aplikacji BLE, ESP32 ponownie przyjmuje komendy z USB.
+
 ## Start automatyczny po wlaczeniu zasilania robota (headless)
 
 Jesli Raspberry Pi ma jechac bez monitora/klawiatury/myszki, uzyj uslugi systemd.

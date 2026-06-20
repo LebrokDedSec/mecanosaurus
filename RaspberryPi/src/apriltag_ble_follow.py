@@ -379,7 +379,10 @@ async def run_follow(cfg: Config) -> None:
     )
 
     dictionary = build_dictionary(cfg.tag_family)
-    detector_params = cv2.aruco.DetectorParameters_create()
+    if hasattr(cv2.aruco, "DetectorParameters_create"):
+        detector_params = cv2.aruco.DetectorParameters_create()
+    else:
+        detector_params = cv2.aruco.DetectorParameters()
     detector_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
 
     address = await discover_device(cfg)

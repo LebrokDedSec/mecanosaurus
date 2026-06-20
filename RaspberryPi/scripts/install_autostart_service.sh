@@ -15,17 +15,18 @@ trap 'rm -f "${SERVICE_TMP}"' EXIT
 
 cat >"${SERVICE_TMP}" <<EOF
 [Unit]
-Description=Mecanosaurus AprilTag BLE follow
-After=network-online.target bluetooth.target
-Wants=network-online.target bluetooth.target
+Description=Mecanosaurus AprilTag USB follow
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=${RUN_USER}
 Group=${RUN_GROUP}
+SupplementaryGroups=video
 WorkingDirectory=${ROOT_DIR}
 EnvironmentFile=-${ENV_FILE}
-ExecStart=${ROOT_DIR}/scripts/start_apriltag_ble_follow.sh
+ExecStart=${ROOT_DIR}/scripts/start_apriltag_usb_follow.sh
 Restart=always
 RestartSec=2
 StartLimitIntervalSec=0
@@ -37,7 +38,7 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-sudo install -m 755 "${ROOT_DIR}/scripts/start_apriltag_ble_follow.sh" "${ROOT_DIR}/scripts/start_apriltag_ble_follow.sh"
+sudo chmod 755 "${ROOT_DIR}/scripts/start_apriltag_usb_follow.sh"
 sudo install -m 644 "${SERVICE_TMP}" "/etc/systemd/system/${SERVICE_NAME}"
 
 if [[ ! -f "${ENV_FILE}" ]]; then
@@ -76,6 +77,11 @@ LOOP_HZ=20
 
 # Keep disabled for onboard headless mode
 SHOW_PREVIEW=0
+
+# USB serial link to ESP32
+SERIAL_PORT=/dev/ttyACM0
+SERIAL_BAUD=115200
+TURN_ONLY_ANGLE_DEG=20
 EOF
 fi
 
