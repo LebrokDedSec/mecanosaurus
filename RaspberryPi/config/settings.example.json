@@ -1,0 +1,6 @@
+{
+  "robot_name": "mecanosaurus-rpi",
+  "control_hz": 20,
+  "uart_port": "/dev/ttyUSB0",
+  "uart_baud": 115200
+}

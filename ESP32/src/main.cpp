@@ -99,6 +99,11 @@ constexpr bool kRgbPinConflictsWithEncoder =
   (kRgbPin == kRearLeftEncAPin) || (kRgbPin == kRearLeftEncBPin) ||
   (kRgbPin == kRearRightEncAPin) || (kRgbPin == kRearRightEncBPin);
 constexpr bool kUseStatusLed = false;
+constexpr uint16_t kInvalidConnHandle = 0xFFFF;
+constexpr bool kEnableRpiFallbackDemo = false;
+constexpr uint32_t kRpiFallbackPhaseMs = 4000;
+constexpr float kRpiFallbackStrafeSpeed = 0.60f;
+constexpr size_t kSerialLineMaxLen = 96;
 
 struct MotorPins {
   const char* name;
@@ -190,6 +195,16 @@ uint32_t gLastControlMs = 0;
 uint32_t gLastTelemetryMs = 0;
 uint32_t gEncoderTestStartMs = 0;
 int gLastEncoderTestPhase = -1;
+uint16_t gConnectedHandles[8] = {kInvalidConnHandle, kInvalidConnHandle,
+                                 kInvalidConnHandle, kInvalidConnHandle,
+                                 kInvalidConnHandle, kInvalidConnHandle,
+                                 kInvalidConnHandle, kInvalidConnHandle};
+size_t gConnectedHandleCount = 0;
+uint16_t gActiveControllerConnHandle = kInvalidConnHandle;
+uint16_t gLastDisconnectConnHandle = kInvalidConnHandle;
+int gLastDisconnectReason = 0;
+uint32_t gLastDisconnectReasonMs = 0;
+std::string gSerialRxLine;
 
 constexpr const char* kWheelNames[4] = {
   "FRONT_LEFT",
@@ -204,6 +219,91 @@ constexpr const char* kEncoderNames[4] = {
   "ENC RL",
   "ENC RR",
 };
+
+void registerConnection(uint16_t connHandle) {
+  if (connHandle == kInvalidConnHandle) {
+    return;
+  }
+
+  for (size_t i = 0; i < gConnectedHandleCount; ++i) {
+    if (gConnectedHandles[i] == connHandle) {
+      gActiveControllerConnHandle = connHandle;
+      return;
+    }
+  }
+
+  if (gConnectedHandleCount < (sizeof(gConnectedHandles) / sizeof(gConnectedHandles[0]))) {
+    gConnectedHandles[gConnectedHandleCount++] = connHandle;
+  }
+
+  // Priority to the most recently connected controller (mobile app can take over).
+  gActiveControllerConnHandle = connHandle;
+}
+
+void unregisterConnection(uint16_t connHandle) {
+  if (connHandle == kInvalidConnHandle || gConnectedHandleCount == 0) {
+    return;
+  }
+
+  size_t removeIndex = gConnectedHandleCount;
+  for (size_t i = 0; i < gConnectedHandleCount; ++i) {
+    if (gConnectedHandles[i] == connHandle) {
+      removeIndex = i;
+      break;
+    }
+  }
+
+  if (removeIndex == gConnectedHandleCount) {
+    return;
+  }
+
+  for (size_t i = removeIndex; i + 1 < gConnectedHandleCount; ++i) {
+    gConnectedHandles[i] = gConnectedHandles[i + 1];
+  }
+  gConnectedHandles[gConnectedHandleCount - 1] = kInvalidConnHandle;
+  --gConnectedHandleCount;
+
+  if (gActiveControllerConnHandle == connHandle) {
+    gActiveControllerConnHandle =
+        gConnectedHandleCount > 0 ? gConnectedHandles[gConnectedHandleCount - 1]
+                                 : kInvalidConnHandle;
+  }
+}
+
+bool isActiveController(uint16_t connHandle) {
+  return connHandle != kInvalidConnHandle &&
+         gActiveControllerConnHandle != kInvalidConnHandle &&
+         connHandle == gActiveControllerConnHandle;
+}
+
+int handleGapEventForDisconnectReason(ble_gap_event* event, void* /*arg*/) {
+  if (event == nullptr) {
+    return 0;
+  }
+
+  if (event->type == BLE_GAP_EVENT_DISCONNECT) {
+    gLastDisconnectConnHandle = event->disconnect.conn.conn_handle;
+    gLastDisconnectReason = event->disconnect.reason;
+    gLastDisconnectReasonMs = millis();
+  }
+
+  return 0;
+}
+
+DriveCommand getRpiFallbackCommand(uint32_t nowMs) {
+  DriveCommand command;
+  if (!kEnableRpiFallbackDemo) {
+    return command;
+  }
+
+  const uint32_t cycleMs = std::max<uint32_t>(kRpiFallbackPhaseMs, 1U) * 2U;
+  const uint32_t inCycle = nowMs % cycleMs;
+  command.x = (inCycle < kRpiFallbackPhaseMs) ? kRpiFallbackStrafeSpeed
+                                              : -kRpiFallbackStrafeSpeed;
+  command.y = 0.0f;
+  command.omega = 0.0f;
+  return command;
+}
 
 void setStatusLed(bool on) {
   if (!kUseStatusLed) {
@@ -553,11 +653,76 @@ bool parseDriveCommand(const std::string& payload, DriveCommand& command) {
   return true;
 }
 
+void handleSerialControlPayload(const std::string& payload) {
+  if (payload.empty()) {
+    return;
+  }
+
+  if (gActiveControllerConnHandle != kInvalidConnHandle) {
+    if (!kSerialOnlyReceivedValues) {
+      Serial.printf("USB RX ignored while BLE active: %s\n", payload.c_str());
+    }
+    return;
+  }
+
+  DriveCommand nextCommand;
+  if (!parseDriveCommand(payload, nextCommand)) {
+    if (!kSerialOnlyReceivedValues) {
+      Serial.printf("USB RX bad payload: %s\n", payload.c_str());
+    }
+    return;
+  }
+
+  gDriveCommand = nextCommand;
+  gLastCommandMs = millis();
+  applyDriveCommand(gDriveCommand);
+}
+
+void processSerialControlInput() {
+  while (Serial.available() > 0) {
+    const int incoming = Serial.read();
+    if (incoming < 0) {
+      continue;
+    }
+
+    const char c = static_cast<char>(incoming);
+    if (c == '\n' || c == '\r') {
+      if (!gSerialRxLine.empty()) {
+        handleSerialControlPayload(gSerialRxLine);
+        gSerialRxLine.clear();
+      }
+      continue;
+    }
+
+    if (gSerialRxLine.size() >= kSerialLineMaxLen) {
+      gSerialRxLine.clear();
+      continue;
+    }
+
+    gSerialRxLine.push_back(c);
+  }
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server) override {
     if (!kSerialOnlyReceivedValues) {
       Serial.printf("BLE connected, active links: %d\n", server->getConnectedCount());
     }
+  }
+
+  void onConnect(NimBLEServer* server, ble_gap_conn_desc* desc) override {
+    if (desc != nullptr) {
+      registerConnection(desc->conn_handle);
+      if (!kSerialOnlyReceivedValues) {
+        Serial.printf("BLE connect handle=%u active=%u links=%d\n",
+                      static_cast<unsigned>(desc->conn_handle),
+                      static_cast<unsigned>(gActiveControllerConnHandle),
+                      server->getConnectedCount());
+      }
+      return;
+    }
+
+    onConnect(server);
   }
 
   void onDisconnect(NimBLEServer* server) override {
@@ -568,11 +733,85 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       Serial.printf("BLE disconnected, active links: %d\n", server->getConnectedCount());
     }
   }
+
+  void onDisconnect(NimBLEServer* server, ble_gap_conn_desc* desc) override {
+    if (desc != nullptr) {
+      const uint16_t disconnectedHandle = desc->conn_handle;
+      const bool wasActiveController = isActiveController(disconnectedHandle);
+      unregisterConnection(disconnectedHandle);
+
+      if (wasActiveController) {
+        stopAllMotors();
+        gDriveCommand = DriveCommand{};
+      }
+
+      NimBLEDevice::startAdvertising();
+      if (!kSerialOnlyReceivedValues) {
+        int reasonCode = 0;
+        const bool reasonMatchesHandle =
+            (gLastDisconnectConnHandle == disconnectedHandle) &&
+            ((millis() - gLastDisconnectReasonMs) < 2000U);
+        if (reasonMatchesHandle) {
+          reasonCode = gLastDisconnectReason;
+        }
+
+        Serial.printf(
+            "BLE disconnect handle=%u active=%u links=%d reason=%d (%s)\n",
+                      static_cast<unsigned>(disconnectedHandle),
+                      static_cast<unsigned>(gActiveControllerConnHandle),
+                      server->getConnectedCount(), reasonCode,
+                      NimBLEUtils::returnCodeToString(reasonCode));
+      }
+      return;
+    }
+
+    onDisconnect(server);
+  }
 };
 
 class ControlCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* characteristic) override {
     if (kEncoderTestOnly) {
+      return;
+    }
+
+    const std::string payload = characteristic->getValue();
+    DriveCommand nextCommand;
+
+    if (!parseDriveCommand(payload, nextCommand)) {
+      if (!kSerialOnlyReceivedValues) {
+        Serial.printf("BLE RX bad payload: %s\n", payload.c_str());
+      }
+      return;
+    }
+
+    gDriveCommand = nextCommand;
+    gLastCommandMs = millis();
+    applyDriveCommand(gDriveCommand);
+    Serial.printf("%.3f,%.3f,%.3f\n", gDriveCommand.x, gDriveCommand.y,
+                  gDriveCommand.omega);
+  }
+
+  void onWrite(NimBLECharacteristic* characteristic, ble_gap_conn_desc* desc) override {
+    if (kEncoderTestOnly) {
+      return;
+    }
+
+    if (desc == nullptr) {
+      onWrite(characteristic);
+      return;
+    }
+
+    const uint16_t writerHandle = desc->conn_handle;
+    if (gActiveControllerConnHandle == kInvalidConnHandle) {
+      registerConnection(writerHandle);
+    }
+    if (!isActiveController(writerHandle)) {
+      if (!kSerialOnlyReceivedValues) {
+        Serial.printf("BLE RX ignored from handle=%u active=%u\n",
+                      static_cast<unsigned>(writerHandle),
+                      static_cast<unsigned>(gActiveControllerConnHandle));
+      }
       return;
     }
 
@@ -641,6 +880,7 @@ void setup() {
   }
 
   NimBLEDevice::init(kBleDeviceName);
+  NimBLEDevice::setCustomGapHandler(handleGapEventForDisconnectReason);
   gServer = NimBLEDevice::createServer();
   gServer->setCallbacks(&gServerCallbacks);
 
@@ -680,7 +920,9 @@ void setup() {
 }
 
 void loop() {
+  const uint32_t now = millis();
   updateHeartbeat();
+  processSerialControlInput();
   reportEncoders();
 
   if (kEncoderTestOnly) {
@@ -715,7 +957,20 @@ void loop() {
     }
   }
 
-  if (millis() - gLastCommandMs > kCommandTimeoutMs) {
+  if (gActiveControllerConnHandle == kInvalidConnHandle) {
+    if (now - gLastCommandMs > kCommandTimeoutMs) {
+      if (kEnableRpiFallbackDemo) {
+        commandForLoop = getRpiFallbackCommand(now);
+        gDriveCommand = commandForLoop;
+        gLastCommandMs = now;
+      } else {
+        gDriveCommand = DriveCommand{};
+        commandForLoop = gDriveCommand;
+      }
+    } else {
+      commandForLoop = gDriveCommand;
+    }
+  } else if (now - gLastCommandMs > kCommandTimeoutMs) {
     gDriveCommand = DriveCommand{};
     commandForLoop = gDriveCommand;
   } else {
