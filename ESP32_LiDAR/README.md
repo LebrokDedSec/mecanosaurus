@@ -6,7 +6,8 @@ This folder contains firmware for the second ESP32 board responsible for LiDAR h
 
 - PlatformIO project config in `platformio.ini`
 - Starter Arduino firmware in `src/main.cpp`
-- Placeholder serial loop for LiDAR integration
+- LiDAR PWM on GPIO 14 and LiDAR UART RX on GPIO 13
+- DFPlayer Mini UART support on RX GPIO 12 / TX GPIO 11
 
 ## Quick start
 
@@ -23,6 +24,19 @@ This folder contains firmware for the second ESP32 board responsible for LiDAR h
 ## Next step
 
 Replace the placeholder logic in `src/main.cpp` with the specific LiDAR driver and pin mapping for your sensor.
+
+## USB serial commands for DFPlayer Mini
+
+After flashing, open the USB serial monitor at 115200 and send one of these lines:
+
+- `MP3 PLAY 1`
+- `MP3 LOOP 2`
+- `MP3 STOP`
+- `MP3 NEXT`
+- `MP3 PREV`
+- `MP3 VOL 24`
+- `MP3 INIT`
+- `MP3 HELP`
 
 ## Windows 2D viewer (top view)
 
