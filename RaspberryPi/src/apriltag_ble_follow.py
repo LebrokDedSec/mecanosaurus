@@ -71,6 +71,10 @@ class Config:
     deadband_omega: float
     smooth_alpha: float
     distance_scale: float
+    search_enabled: bool
+    search_omega: float
+    search_phase_sec: float
+    center_only: bool
     ble_name: str
     ble_address: str
     ble_service_uuid: str
@@ -133,6 +137,30 @@ def parse_args() -> Config:
 
     parser.add_argument("--smooth-alpha", type=float, default=0.35)
     parser.add_argument("--distance-scale", type=float, default=1.52)
+    parser.add_argument(
+        "--search-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When tag is not visible, sweep left/right with omega to search for it",
+    )
+    parser.add_argument(
+        "--search-omega",
+        type=float,
+        default=0.40,
+        help="Normalized omega used while sweeping for a tag",
+    )
+    parser.add_argument(
+        "--search-phase-sec",
+        type=float,
+        default=1.2,
+        help="Duration of one sweep direction before switching sign",
+    )
+    parser.add_argument(
+        "--center-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When tag is visible, only center it in camera axis (no forward/strafe)",
+    )
 
     parser.add_argument("--ble-name", default="ESP32-S3-DEVKITC-1-N16R8V")
     parser.add_argument("--ble-address", default="", help="Optional BLE MAC address to skip scan")
@@ -179,6 +207,10 @@ def parse_args() -> Config:
         deadband_omega=max(args.deadband_omega, 0.0),
         smooth_alpha=float(np.clip(args.smooth_alpha, 0.0, 1.0)),
         distance_scale=max(args.distance_scale, 0.01),
+        search_enabled=bool(args.search_enabled),
+        search_omega=float(np.clip(args.search_omega, 0.0, 1.0)),
+        search_phase_sec=max(args.search_phase_sec, 0.10),
+        center_only=bool(args.center_only),
         ble_name=args.ble_name,
         ble_address=args.ble_address,
         ble_service_uuid=args.ble_service_uuid,
@@ -284,8 +316,8 @@ def build_drive_command(
     x_corr = x_m * cfg.distance_scale
 
     distance_error = z_corr - cfg.target_distance
-    y_cmd = cfg.kp_forward * max(distance_error, 0.0)
-    x_cmd = cfg.kp_strafe * x_corr
+    y_cmd = 0.0 if cfg.center_only else (cfg.kp_forward * max(distance_error, 0.0))
+    x_cmd = 0.0 if cfg.center_only else (cfg.kp_strafe * x_corr)
     bearing_rad = math.atan2(x_corr, max(z_corr, 1e-6))
     omega_cmd = -cfg.kp_turn * bearing_rad
 
@@ -297,6 +329,16 @@ def build_drive_command(
     y_cmd = clamp_unit(apply_deadband(y_cmd, cfg.deadband_y))
     omega_cmd = clamp_unit(apply_deadband(omega_cmd, cfg.deadband_omega))
     return x_cmd, y_cmd, omega_cmd
+
+
+def build_search_command(now_s: float, cfg: Config) -> tuple[float, float, float]:
+    if not cfg.search_enabled:
+        return 0.0, 0.0, 0.0
+
+    phase = int(now_s / cfg.search_phase_sec)
+    sign = -1.0 if (phase % 2 == 0) else 1.0
+    omega_cmd = clamp_unit(apply_deadband(sign * cfg.search_omega, cfg.deadband_omega))
+    return 0.0, 0.0, omega_cmd
 
 
 def format_drive_payload(x: float, y: float, omega: float) -> str:
@@ -421,7 +463,8 @@ async def run_follow(cfg: Config) -> None:
             f"vy={cfg.max_y * max_vy_mps:.3f} m/s, "
             f"omega={cfg.max_omega * max_omega_radps:.3f} rad/s"
         )
-        print(f"Waiting for tag id={cfg.tag_id} at target distance {cfg.target_distance:.2f} m")
+        mode_text = "center-only" if cfg.center_only else "follow+center"
+        print(f"Waiting for tag id={cfg.tag_id} | mode={mode_text}")
 
         period = 1.0 / cfg.loop_hz
         try:
@@ -513,13 +556,18 @@ async def run_follow(cfg: Config) -> None:
                         )
                 else:
                     if (not has_seen_tag) or (now - last_seen > cfg.command_timeout):
-                        await client.write_gatt_char(cfg.ble_control_uuid, b"STOP", response=False)
+                        sx, sy, so = build_search_command(now, cfg)
+                        if sx == 0.0 and sy == 0.0 and so == 0.0:
+                            await client.write_gatt_char(cfg.ble_control_uuid, b"STOP", response=False)
+                        else:
+                            payload = format_drive_payload(sx, sy, so)
+                            await client.write_gatt_char(cfg.ble_control_uuid, payload.encode("utf-8"), response=False)
                     if now - last_print > 0.5:
                         last_print = now
                         if has_seen_tag:
-                            print("tag lost -> STOP")
+                            print("tag lost -> searching sweep")
                         else:
-                            print("waiting for tag -> STOP")
+                            print("waiting for tag -> searching sweep")
 
                 if cfg.show_preview:
                     cv2.imshow("AprilTag BLE Follow", frame)

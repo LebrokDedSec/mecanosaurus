@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
+
+os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype/dejavu")
 
 import cv2
 import numpy as np
@@ -86,12 +89,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--simple-overlay",
         action="store_true",
-        help="Draw only the detected outline and axes, without any prism geometry",
+        help="Draw only the detected outline and tilt indicator, without prism geometry",
+    )
+    parser.add_argument(
+        "--show-axes",
+        action="store_true",
+        help="Draw 3D coordinate axes on top of detected tags",
     )
     parser.add_argument(
         "--distance-scale",
         type=float,
-        default=1.0,
+        default=2.4,
         help="Multiplier applied to distance and lateral offset to match real-world scale",
     )
     return parser.parse_args()
@@ -591,9 +599,12 @@ def main() -> None:
         print("Overlay mode: simple")
     else:
         print("Overlay mode: prism")
+    print(f"Coordinate axes: {'on' if args.show_axes else 'off'}")
     print("Press 'q' to quit.")
 
     prev = time.time()
+    window_name = "Mecanosaurus Camera Viewer"
+
     try:
         while True:
             ok, frame = cap.read()
@@ -688,7 +699,8 @@ def main() -> None:
                         if args.simple_overlay:
                             draw_simple_orientation_arrow(frame, corners_f)
                         else:
-                            cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, args.tag_size * 0.6, 2)
+                            if args.show_axes:
+                                cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, args.tag_size * 0.6, 2)
                             draw_prism(
                                 frame,
                                 corners_f,
@@ -795,7 +807,8 @@ def main() -> None:
                     if args.simple_overlay:
                         draw_simple_orientation_arrow(frame, corners_f)
                     else:
-                        cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, args.tag_size * 0.6, 2)
+                        if args.show_axes:
+                            cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, args.tag_size * 0.6, 2)
                         draw_prism(
                             frame,
                             corners_f,
@@ -907,7 +920,8 @@ def main() -> None:
                     if args.simple_overlay:
                         draw_simple_orientation_arrow(frame, corners_f)
                     else:
-                        cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, args.tag_size * 0.6, 2)
+                        if args.show_axes:
+                            cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, args.tag_size * 0.6, 2)
                         draw_prism(
                             frame,
                             corners_f,
@@ -969,7 +983,11 @@ def main() -> None:
                 2,
                 cv2.LINE_AA,
             )
-            cv2.imshow("Mecanosaurus Camera Viewer", frame)
+            cv2.imshow(window_name, frame)
+
+            # Allow graceful exit when the user closes the OpenCV window via X.
+            if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):

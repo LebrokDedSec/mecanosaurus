@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Slider
 
 try:
     import serial
@@ -77,9 +78,9 @@ class PointCloudState:
 
                 angle_deg = (i + 0.5) * self.resolution_deg
                 angle_rad = math.radians(angle_deg)
-                # Sensor orientation on this robot is mirrored against screen X.
-                x = -math.cos(angle_rad) * point.distance_mm
-                y = math.sin(angle_rad) * point.distance_mm
+                # Rotate view by 90 degrees clockwise.
+                x = math.sin(angle_rad) * point.distance_mm
+                y = math.cos(angle_rad) * point.distance_mm
                 points.append((x, y))
 
         return points, rx_lines, bad_lines
@@ -139,8 +140,19 @@ def serial_reader(port: str, baud: int, state: PointCloudState, stop_event: thre
         stop_event.set()
 
 
+def _build_range_rings(ax, max_distance_mm: int):
+    ring_patches = []
+    ring_step = max(250, max_distance_mm // 8)
+    for r in range(ring_step, max_distance_mm + 1, ring_step):
+        circle = plt.Circle((0, 0), r, color="#b0b0b0", fill=False, linewidth=0.7, alpha=0.7)
+        ax.add_patch(circle)
+        ring_patches.append(circle)
+    return ring_patches
+
+
 def build_plot(max_distance_mm: int):
     fig, ax = plt.subplots(figsize=(8, 8))
+    plt.subplots_adjust(bottom=0.16)
     ax.set_title("LiDAR 2D Top View")
     ax.set_xlabel("X [mm]")
     ax.set_ylabel("Y [mm]")
@@ -148,11 +160,7 @@ def build_plot(max_distance_mm: int):
     ax.set_xlim(-max_distance_mm, max_distance_mm)
     ax.set_ylim(-max_distance_mm, max_distance_mm)
     ax.grid(True, linestyle=":", linewidth=0.6)
-
-    ring_step = max(250, max_distance_mm // 8)
-    for r in range(ring_step, max_distance_mm + 1, ring_step):
-        circle = plt.Circle((0, 0), r, color="#b0b0b0", fill=False, linewidth=0.7, alpha=0.7)
-        ax.add_patch(circle)
+    ring_patches = _build_range_rings(ax, max_distance_mm)
 
     ax.axhline(0, color="#808080", linewidth=0.8)
     ax.axvline(0, color="#808080", linewidth=0.8)
@@ -168,7 +176,19 @@ def build_plot(max_distance_mm: int):
         fontsize=9,
         bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "#cccccc"},
     )
-    return fig, ax, scatter, stats_text
+
+    slider_max = max(12000, max_distance_mm * 3)
+    slider_ax = fig.add_axes([0.20, 0.06, 0.65, 0.03])
+    range_slider = Slider(
+        slider_ax,
+        "Scale [mm]",
+        valmin=500,
+        valmax=slider_max,
+        valinit=max_distance_mm,
+        valstep=50,
+    )
+
+    return fig, ax, scatter, stats_text, ring_patches, range_slider
 
 
 def main() -> None:
@@ -208,10 +228,30 @@ def main() -> None:
     )
     reader.start()
 
-    fig, _, scatter, stats_text = build_plot(args.max_range_mm)
+    fig, ax, scatter, stats_text, ring_patches, range_slider = build_plot(args.max_range_mm)
+
+    view_range_mm = {"value": int(args.max_range_mm)}
+
+    def set_view_range(new_range_mm: int) -> None:
+        new_range_mm = max(500, int(new_range_mm))
+        view_range_mm["value"] = new_range_mm
+
+        ax.set_xlim(-new_range_mm, new_range_mm)
+        ax.set_ylim(-new_range_mm, new_range_mm)
+
+        for patch in ring_patches:
+            patch.remove()
+        ring_patches.clear()
+        ring_patches.extend(_build_range_rings(ax, new_range_mm))
+        fig.canvas.draw_idle()
+
+    def on_slider_change(value: float) -> None:
+        set_view_range(int(value))
+
+    range_slider.on_changed(on_slider_change)
 
     def animate(_frame):
-        points, rx_lines, bad_lines = state.snapshot(args.max_age_s, args.max_range_mm)
+        points, rx_lines, bad_lines = state.snapshot(args.max_age_s, view_range_mm["value"])
         if points:
             scatter.set_offsets(points)
         else:
@@ -220,7 +260,7 @@ def main() -> None:
         stats_text.set_text(
             f"port={args.port}  points={len(points)}\\n"
             f"rx_lines={rx_lines}  bad_lines={bad_lines}\\n"
-            f"min_conf={args.min_confidence}  max_age={args.max_age_s:.1f}s"
+            f"min_conf={args.min_confidence}  max_age={args.max_age_s:.1f}s  scale={view_range_mm['value']}mm"
         )
         return scatter, stats_text
 

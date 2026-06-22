@@ -59,6 +59,10 @@ class Config:
     smooth_alpha: float
     distance_scale: float
     turn_only_angle_deg: float
+    search_enabled: bool
+    search_omega: float
+    search_phase_sec: float
+    center_only: bool
     serial_port: str
     serial_baud: int
     show_preview: bool
@@ -111,6 +115,30 @@ def parse_args() -> Config:
         default=20.0,
         help="If |bearing| exceeds this value, rotate in place without forward motion",
     )
+    parser.add_argument(
+        "--search-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When tag is not visible, sweep left/right with omega to search for it",
+    )
+    parser.add_argument(
+        "--search-omega",
+        type=float,
+        default=0.40,
+        help="Normalized omega used while sweeping for a tag",
+    )
+    parser.add_argument(
+        "--search-phase-sec",
+        type=float,
+        default=1.2,
+        help="Duration of one sweep direction before switching sign",
+    )
+    parser.add_argument(
+        "--center-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When tag is visible, only center it in camera axis (no forward/strafe)",
+    )
     parser.add_argument("--serial-port", default="/dev/ttyACM0")
     parser.add_argument("--serial-baud", type=int, default=115200)
     parser.add_argument("--show-preview", action="store_true")
@@ -147,6 +175,10 @@ def parse_args() -> Config:
         smooth_alpha=float(np.clip(args.smooth_alpha, 0.0, 1.0)),
         distance_scale=max(args.distance_scale, 0.01),
         turn_only_angle_deg=max(args.turn_only_angle_deg, 1.0),
+        search_enabled=bool(args.search_enabled),
+        search_omega=float(np.clip(args.search_omega, 0.0, 1.0)),
+        search_phase_sec=max(args.search_phase_sec, 0.10),
+        center_only=bool(args.center_only),
         serial_port=args.serial_port,
         serial_baud=max(args.serial_baud, 1200),
         show_preview=args.show_preview,
@@ -223,13 +255,15 @@ def build_drive_command(z_m: float, x_m: float, cfg: Config):
     # Move toward the tag only when heading error is reasonably small.
     distance_error = z_corr - cfg.target_distance
     turn_only_angle_rad = math.radians(cfg.turn_only_angle_deg)
-    if abs_bearing >= turn_only_angle_rad:
+    if cfg.center_only:
+        y_cmd = 0.0
+    elif abs_bearing >= turn_only_angle_rad:
         y_cmd = 0.0
     else:
         heading_scale = 1.0 - (abs_bearing / turn_only_angle_rad)
         y_cmd = cfg.kp_forward * max(distance_error, 0.0) * heading_scale
 
-    # Lateral strafe is disabled: steering is based on angular deviation.
+    # Centering is based on angular deviation; no lateral strafe.
     x_cmd = 0.0
     omega_cmd = -cfg.kp_turn * bearing_rad
 
@@ -241,6 +275,16 @@ def build_drive_command(z_m: float, x_m: float, cfg: Config):
     y_cmd = clamp_unit(apply_deadband(y_cmd, cfg.deadband_y))
     omega_cmd = clamp_unit(apply_deadband(omega_cmd, cfg.deadband_omega))
     return x_cmd, y_cmd, omega_cmd
+
+
+def build_search_command(now_s: float, cfg: Config) -> tuple[float, float, float]:
+    if not cfg.search_enabled:
+        return 0.0, 0.0, 0.0
+
+    phase = int(now_s / cfg.search_phase_sec)
+    sign = -1.0 if (phase % 2 == 0) else 1.0
+    omega_cmd = clamp_unit(apply_deadband(sign * cfg.search_omega, cfg.deadband_omega))
+    return 0.0, 0.0, omega_cmd
 
 
 def send_payload(ser: serial.Serial, payload: str) -> None:
@@ -305,7 +349,8 @@ def main() -> None:
     print(
         f"Kinematic limits: vx_max={max_vx_mps:.3f} m/s, vy_max={max_vy_mps:.3f} m/s, omega_max={max_omega_radps:.3f} rad/s"
     )
-    print(f"Waiting for tag id={cfg.tag_id} at target distance {cfg.target_distance:.2f} m")
+    mode_text = "center-only" if cfg.center_only else "follow+center"
+    print(f"Waiting for tag id={cfg.tag_id} | mode={mode_text}")
 
     try:
         while True:
@@ -378,10 +423,17 @@ def main() -> None:
                     cv2.putText(frame, payload, tuple(corners_i[0].tolist()), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
             else:
                 if (not has_seen_tag) or (now - last_seen > cfg.command_timeout):
-                    send_payload(ser, "STOP")
+                    sx, sy, so = build_search_command(now, cfg)
+                    if sx == 0.0 and sy == 0.0 and so == 0.0:
+                        send_payload(ser, "STOP")
+                    else:
+                        send_payload(ser, f"DRIVE:{sx:.3f},{sy:.3f},{so:.3f}")
                 if now - last_print > 0.5:
                     last_print = now
-                    print("tag lost -> STOP" if has_seen_tag else "waiting for tag -> STOP")
+                    if has_seen_tag:
+                        print("tag lost -> searching sweep")
+                    else:
+                        print("waiting for tag -> searching sweep")
 
             if cfg.show_preview:
                 cv2.imshow("AprilTag USB Follow", frame)

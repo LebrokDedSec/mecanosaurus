@@ -1,12 +1,8 @@
 #include <Arduino.h>
 
-#include <cctype>
-
 namespace {
 constexpr int kLidarPwmPin = 14;
 constexpr int kLidarRxPin = 13;
-constexpr int kDfPlayerRxPin = 11;  // ESP RX, podlacz do TX DFPlayer
-constexpr int kDfPlayerTxPin = 12;  // ESP TX, podlacz do RX DFPlayer
 
 constexpr int kPwmChannel = 0;
 constexpr int kPwmFrequencyHz = 20000;
@@ -14,20 +10,14 @@ constexpr int kPwmResolutionBits = 8;
 constexpr int kPwmDuty = 180;  // 0..255
 
 constexpr uint32_t kUsbBaud = 115200;
-constexpr uint32_t kDfPlayerBaud = 9600;
 constexpr uint32_t kStatsIntervalMs = 1000;
 constexpr uint32_t kBaudSwitchIntervalMs = 2500;
-constexpr uint32_t kDfPlayerInitDelayMs = 500;
 constexpr int kHexDumpLineBytes = 24;
 constexpr size_t kRawPrintBytes = 1200;
 constexpr size_t kSampleBytes = 2048;
 constexpr uint8_t kMinFrameLen = 8;
 constexpr uint8_t kMaxFrameLen = 96;
 constexpr int kTopHeaders = 8;
-constexpr uint8_t kDfPlayerDefaultVolume = 24;
-constexpr size_t kConsoleLineMaxLen = 64;
-constexpr bool kDfPlayerUseFeedback = true;
-constexpr uint32_t kConsoleCommandTimeoutMs = 150;
 
 constexpr uint32_t kBaudCandidates[] = {
   230400,
@@ -81,219 +71,11 @@ bool gFrameSync = false;
 uint8_t gFrameIndex = 0;
 uint8_t gFrameBuf[kMaxFrameLen];
 bool gPointCloudMode = false;
-String gConsoleLine;
-uint8_t gDfPlayerVolume = kDfPlayerDefaultVolume;
-int gDfPlayerRxDumpCount = 0;
-uint32_t gLastConsoleInputMs = 0;
 
 constexpr uint8_t kLd06Header1 = 0x54;
 constexpr uint8_t kLd06Header2 = 0x2C;
 constexpr uint8_t kLd06FrameLen = 47;
 constexpr int kLd06PointCount = 12;
-
-HardwareSerial& gLidarSerial = Serial2;
-HardwareSerial& gDfPlayerSerial = Serial1;
-
-void printHexByte(uint8_t b);
-
-uint16_t dfPlayerChecksum(uint8_t command, uint16_t parameter) {
-  const uint16_t sum = static_cast<uint16_t>(0xFF + 0x06 + command + 0x00 +
-                                             (parameter >> 8) +
-                                             (parameter & 0xFF));
-  return static_cast<uint16_t>(0U - sum);
-}
-
-void sendDfPlayerCommand(uint8_t command, uint16_t parameter) {
-  const uint16_t checksum = dfPlayerChecksum(command, parameter);
-  const uint8_t frame[] = {
-      0x7E,
-      0xFF,
-      0x06,
-      command,
-  static_cast<uint8_t>(kDfPlayerUseFeedback ? 0x01 : 0x00),
-      static_cast<uint8_t>((parameter >> 8) & 0xFF),
-      static_cast<uint8_t>(parameter & 0xFF),
-      static_cast<uint8_t>((checksum >> 8) & 0xFF),
-      static_cast<uint8_t>(checksum & 0xFF),
-      0xEF,
-  };
-  gDfPlayerSerial.write(frame, sizeof(frame));
-}
-
-void setDfPlayerVolume(uint8_t volume) {
-  gDfPlayerVolume = static_cast<uint8_t>(constrain(volume, 0, 30));
-  sendDfPlayerCommand(0x06, gDfPlayerVolume);
-}
-
-void initDfPlayer() {
-  gDfPlayerSerial.begin(kDfPlayerBaud, SERIAL_8N1, kDfPlayerRxPin,
-                        kDfPlayerTxPin);
-  delay(kDfPlayerInitDelayMs);
-  sendDfPlayerCommand(0x0C, 0);
-  delay(1000);
-  sendDfPlayerCommand(0x09, 0x0002);
-  delay(300);
-  setDfPlayerVolume(kDfPlayerDefaultVolume);
-  delay(100);
-  sendDfPlayerCommand(0x16, 0);
-}
-
-void printDfPlayerHelp() {
-  Serial.println("MP3 commands:");
-  Serial.println("  MP3 PLAY <track>");
-  Serial.println("  MP3 LOOP <track>");
-  Serial.println("  MP3 STOP");
-  Serial.println("  MP3 NEXT");
-  Serial.println("  MP3 PREV");
-  Serial.println("  MP3 VOL <0-30>");
-  Serial.println("  MP3 INIT");
-  Serial.println("  MP3 HELP");
-}
-
-void trimAsciiWhitespace(String& text) {
-  while (text.length() > 0 &&
-         std::isspace(static_cast<unsigned char>(text[0])) != 0) {
-    text.remove(0, 1);
-  }
-  while (text.length() > 0 &&
-         std::isspace(static_cast<unsigned char>(text[text.length() - 1])) != 0) {
-    text.remove(text.length() - 1, 1);
-  }
-}
-
-void handleConsoleCommand(String line) {
-  trimAsciiWhitespace(line);
-  if (line.length() == 0) {
-    return;
-  }
-
-  line.toUpperCase();
-  if (!line.startsWith("MP3")) {
-    Serial.println("[cmd] unknown. Use MP3 HELP");
-    return;
-  }
-
-  String args = line.substring(3);
-  trimAsciiWhitespace(args);
-
-  if (args == "HELP") {
-    printDfPlayerHelp();
-    return;
-  }
-
-  if (args == "STOP") {
-    sendDfPlayerCommand(0x16, 0);
-    Serial.println("[mp3] stop");
-    return;
-  }
-
-  if (args == "NEXT") {
-    sendDfPlayerCommand(0x01, 0);
-    Serial.println("[mp3] next");
-    return;
-  }
-
-  if (args == "PREV") {
-    sendDfPlayerCommand(0x02, 0);
-    Serial.println("[mp3] prev");
-    return;
-  }
-
-  if (args == "INIT") {
-    initDfPlayer();
-    Serial.println("[mp3] reinitialized");
-    return;
-  }
-
-  if (args.startsWith("PLAY ")) {
-    const long track = args.substring(5).toInt();
-    if (track <= 0 || track > 2999) {
-      Serial.println("[mp3] invalid track");
-      return;
-    }
-    sendDfPlayerCommand(0x03, static_cast<uint16_t>(track));
-    Serial.printf("[mp3] play track=%ld\n", track);
-    return;
-  }
-
-  if (args.startsWith("LOOP ")) {
-    const long track = args.substring(5).toInt();
-    if (track <= 0 || track > 2999) {
-      Serial.println("[mp3] invalid track");
-      return;
-    }
-    sendDfPlayerCommand(0x08, static_cast<uint16_t>(track));
-    Serial.printf("[mp3] loop track=%ld\n", track);
-    return;
-  }
-
-  if (args.startsWith("VOL ")) {
-    const long volume = args.substring(4).toInt();
-    if (volume < 0 || volume > 30) {
-      Serial.println("[mp3] invalid volume");
-      return;
-    }
-    setDfPlayerVolume(static_cast<uint8_t>(volume));
-    Serial.printf("[mp3] volume=%ld\n", volume);
-    return;
-  }
-
-  Serial.println("[cmd] unknown. Use MP3 HELP");
-}
-
-void processUsbConsole() {
-  while (Serial.available() > 0) {
-    const int raw = Serial.read();
-    if (raw < 0) {
-      return;
-    }
-
-    const char ch = static_cast<char>(raw);
-    if (ch == '\r') {
-      continue;
-    }
-
-    gLastConsoleInputMs = millis();
-
-    if (ch == '\n') {
-      handleConsoleCommand(gConsoleLine);
-      gConsoleLine = "";
-      continue;
-    }
-
-    if (gConsoleLine.length() < kConsoleLineMaxLen) {
-      gConsoleLine += ch;
-    }
-  }
-
-  if (gConsoleLine.length() > 0 &&
-      millis() - gLastConsoleInputMs >= kConsoleCommandTimeoutMs) {
-    handleConsoleCommand(gConsoleLine);
-    gConsoleLine = "";
-  }
-}
-
-void processDfPlayerResponses() {
-  while (gDfPlayerSerial.available() > 0) {
-    const int raw = gDfPlayerSerial.read();
-    if (raw < 0) {
-      return;
-    }
-
-    if (gDfPlayerRxDumpCount == 0) {
-      Serial.print("[mp3-rx] ");
-    }
-
-    const uint8_t b = static_cast<uint8_t>(raw);
-    printHexByte(b);
-    ++gDfPlayerRxDumpCount;
-
-    if (gDfPlayerRxDumpCount >= 10) {
-      Serial.println();
-      gDfPlayerRxDumpCount = 0;
-    }
-  }
-}
 
 const char* checksumName(ChecksumType type) {
   switch (type) {
@@ -526,9 +308,9 @@ void resetAnalysisState() {
 }
 
 void startLidarSerial(uint32_t baud) {
-  gLidarSerial.end();
+  Serial2.end();
   delay(20);
-  gLidarSerial.begin(baud, SERIAL_8N1, kLidarRxPin, -1);
+  Serial2.begin(baud, SERIAL_8N1, kLidarRxPin, -1);
 }
 
 void insertTopHeader(uint8_t header,
@@ -796,30 +578,22 @@ void setup() {
   ledcAttachPin(kLidarPwmPin, kPwmChannel);
   ledcWrite(kPwmChannel, kPwmDuty);
 
-  initDfPlayer();
-
   gCurrentBaud = kBaudCandidates[gBaudIndex];
   startLidarSerial(gCurrentBaud);
   gLastBaudSwitchMs = millis();
 
   Serial.println();
   Serial.println("LiDAR start");
-  Serial.println("PWM: pin=14, ch=0, freq=20kHz, duty=180/255");
-  Serial.println("UART: RX=13, TX=none, baud=auto-scan");
-  Serial.println("DFPlayer: RX=12, TX=11, baud=9600");
-  Serial.println("DFPlayer source: TF card");
+  Serial.println("PWM: pin=4, ch=0, freq=20kHz, duty=180/255");
+  Serial.println("UART: RX=16, TX=none, baud=auto-scan");
   Serial.println("Mode: RAW capture + auto frame detect");
-  printDfPlayerHelp();
   Serial.print("[baud] start=");
   Serial.println(gCurrentBaud);
 }
 
 void loop() {
-  processUsbConsole();
-  processDfPlayerResponses();
-
-  while (gLidarSerial.available() > 0) {
-    const uint8_t b = static_cast<uint8_t>(gLidarSerial.read());
+  while (Serial2.available() > 0) {
+    const uint8_t b = static_cast<uint8_t>(Serial2.read());
     ++gRxBytes;
 
     if (gSampleCount < kSampleBytes) {
